@@ -1,35 +1,77 @@
-import Foundation
+import SwiftUI
 import SwiftData
 
-// MARK: - SwiftData models
+// MARK: - SwiftData Models
 
 @Model
-final class WaveEntry {
+final class FridgeItem {
     var id: UUID
-    var date: Date
-    var level: Int
-    var partOfDay: String
-    var tag: String?
+    var name: String
+    var openedDate: Date
+    var useByDate: Date?
+    var status: String   // "active" | "used" | "wasted"
 
-    init(id: UUID = UUID(), date: Date = .now, level: Int, partOfDay: String = "day", tag: String? = nil) {
-        self.id = id
-        self.date = date
-        self.level = level
-        self.partOfDay = partOfDay
-        self.tag = tag
+    init(name: String, openedDate: Date = .now, useByDate: Date? = nil) {
+        self.id = UUID()
+        self.name = name
+        self.openedDate = openedDate
+        self.useByDate = useByDate
+        self.status = "active"
+    }
+
+    /// Days until use-by. Negative = past. Nil if no date.
+    var daysLeft: Int? {
+        guard let d = useByDate else { return nil }
+        return Calendar.current.dateComponents([.day], from: .now, to: d).day
+    }
+
+    var urgencyLevel: UrgencyLevel {
+        guard let days = daysLeft else { return .low }
+        if days < 0  { return .expired }
+        if days == 0 { return .urgent }
+        if days <= 2 { return .soon }
+        return .low
+    }
+}
+
+enum UrgencyLevel: Int, Comparable {
+    case expired = 0, urgent = 1, soon = 2, low = 3
+    static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
+}
+
+@Model
+final class UseIdea {
+    var id: UUID
+    var title: String
+    var ingredients: [String]
+    var steps: [String]
+    var createdDate: Date
+    var fridgeItemNames: [String]   // snapshot of item names used
+
+    init(title: String, ingredients: [String], steps: [String], fridgeItemNames: [String]) {
+        self.id = UUID()
+        self.title = title
+        self.ingredients = ingredients
+        self.steps = steps
+        self.createdDate = .now
+        self.fridgeItemNames = fridgeItemNames
     }
 }
 
 @Model
-final class TrendCache {
+final class SaveLog {
     var id: UUID
-    var weekStart: Date
-    var average: Double
+    var fridgeItemId: UUID
+    var fridgeItemName: String
+    var action: String   // "used" | "wasted"
+    var date: Date
 
-    init(id: UUID = UUID(), weekStart: Date, average: Double) {
-        self.id = id
-        self.weekStart = weekStart
-        self.average = average
+    init(fridgeItemId: UUID, fridgeItemName: String, action: String) {
+        self.id = UUID()
+        self.fridgeItemId = fridgeItemId
+        self.fridgeItemName = fridgeItemName
+        self.action = action
+        self.date = .now
     }
 }
 
@@ -40,9 +82,12 @@ final class AppModel: ObservableObject {
     let container: ModelContainer
     weak var store: Store?
 
-    @Published private(set) var recentEntries: [WaveEntry] = []
-    @Published private(set) var todayEntry: WaveEntry? = nil
-    @Published private(set) var allEntries: [WaveEntry] = []
+    @Published private(set) var items: [FridgeItem] = []
+    @Published private(set) var todayIdea: UseIdea?
+    @Published private(set) var logs: [SaveLog] = []
+    @Published private(set) var lastGeneratedDate: Date?
+
+    private var context: ModelContext { container.mainContext }
 
     init(container: ModelContainer) {
         self.container = container
@@ -50,79 +95,127 @@ final class AppModel: ObservableObject {
     }
 
     static func makeContainer() -> ModelContainer {
-        let schema = Schema([WaveEntry.self, TrendCache.self])
+        let schema = Schema([FridgeItem.self, UseIdea.self, SaveLog.self])
+        let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
         do {
-            let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
             return try ModelContainer(for: schema, configurations: [config])
         } catch {
             let fallback = ModelConfiguration(schema: schema, isStoredInMemoryOnly: true)
-            return try! ModelContainer(for: schema, configurations: [fallback])
+            return (try? ModelContainer(for: schema, configurations: [fallback])) ??
+                (try! ModelContainer(for: schema))
         }
     }
 
     func reload() {
-        let ctx = container.mainContext
-        let descriptor = FetchDescriptor<WaveEntry>(sortBy: [SortDescriptor(\.date, order: .reverse)])
-        let fetched = (try? ctx.fetch(descriptor)) ?? []
-        allEntries = fetched
-        recentEntries = Array(fetched.prefix(7))
-        todayEntry = fetched.first(where: { Calendar.current.isDateInToday($0.date) })
+        let itemDesc = FetchDescriptor<FridgeItem>(sortBy: [SortDescriptor(\.openedDate, order: .reverse)])
+        let ideaDesc = FetchDescriptor<UseIdea>(sortBy: [SortDescriptor(\.createdDate, order: .reverse)])
+        let logDesc  = FetchDescriptor<SaveLog>(sortBy: [SortDescriptor(\.date, order: .reverse)])
+        items     = (try? context.fetch(itemDesc)) ?? []
+        let ideas = (try? context.fetch(ideaDesc)) ?? []
+        logs      = (try? context.fetch(logDesc))  ?? []
+
+        // Today's idea = most recent one generated on today's calendar day
+        let cal = Calendar.current
+        todayIdea = ideas.first { cal.isDateInToday($0.createdDate) }
+        lastGeneratedDate = ideas.first?.createdDate
     }
 
     func refresh() { reload() }
 
-    // MARK: Log energy level
-    func logEnergy(level: Int, partOfDay: String = "day", tag: String? = nil) {
-        let ctx = container.mainContext
-        // Replace existing today entry if same partOfDay
-        if let existing = allEntries.first(where: {
-            Calendar.current.isDateInToday($0.date) && $0.partOfDay == partOfDay
-        }) {
-            existing.level = level
-            existing.tag = tag
-        } else {
-            let entry = WaveEntry(level: level, partOfDay: partOfDay, tag: tag)
-            ctx.insert(entry)
+    // MARK: - Fridge management
+
+    func addItem(name: String, useByDate: Date?) {
+        let item = FridgeItem(name: name, openedDate: .now, useByDate: useByDate)
+        context.insert(item)
+        save()
+        Haptics.tap()
+    }
+
+    func markItem(_ item: FridgeItem, action: String) {
+        let log = SaveLog(fridgeItemId: item.id, fridgeItemName: item.name, action: action)
+        context.insert(log)
+        item.status = action
+        save()
+        Haptics.success()
+    }
+
+    func deleteItem(_ item: FridgeItem) {
+        context.delete(item)
+        save()
+    }
+
+    // MARK: - Idea generation
+
+    /// Active (non-resolved) fridge items sorted by urgency
+    var activeItems: [FridgeItem] {
+        items.filter { $0.status == "active" }
+             .sorted { $0.urgencyLevel < $1.urgencyLevel }
+    }
+
+    /// Generate one use-it-up idea from the most urgent active items.
+    func generateIdea() {
+        let targets = Array(activeItems.prefix(3))
+        guard !targets.isEmpty else { return }
+
+        let names = targets.map { $0.name }
+        let idea = UseIdea(
+            title: ideaTitle(for: names),
+            ingredients: ideaIngredients(for: names),
+            steps: ideaSteps(for: names),
+            fridgeItemNames: names
+        )
+        context.insert(idea)
+        save()
+        Haptics.success()
+    }
+
+    // MARK: - Simple deterministic idea builder (no backend)
+
+    private func ideaTitle(for names: [String]) -> String {
+        switch names.count {
+        case 1: return "Quick \(names[0].capitalized) stir-fry"
+        case 2: return "\(names[0].capitalized) & \(names[1].capitalized) scramble"
+        default: return "\(names[0].capitalized), \(names[1].capitalized) & \(names[2].capitalized) bowl"
         }
-        try? ctx.save()
-        reload()
     }
 
-    // MARK: 7-day rolling average
-    var sevenDayAverage: Double {
-        let relevant = recentEntries.prefix(7)
-        guard !relevant.isEmpty else { return 0 }
-        return Double(relevant.map(\.level).reduce(0, +)) / Double(relevant.count)
+    private func ideaIngredients(for names: [String]) -> [String] {
+        var list = names.map { $0.capitalized }
+        list += ["Olive oil", "Salt & pepper", "Garlic (optional)"]
+        return list
     }
 
-    // MARK: Best time of day (pro)
-    var bestTimeOfDay: String {
-        let mornings = allEntries.filter { $0.partOfDay == "morning" }
-        let evenings = allEntries.filter { $0.partOfDay == "evening" }
-        let morningAvg = mornings.isEmpty ? 0.0 : Double(mornings.map(\.level).reduce(0, +)) / Double(mornings.count)
-        let eveningAvg = evenings.isEmpty ? 0.0 : Double(evenings.map(\.level).reduce(0, +)) / Double(evenings.count)
-        if morningAvg == 0 && eveningAvg == 0 { return "Not enough data" }
-        if morningAvg >= eveningAvg { return "Morning" }
-        return "Evening"
+    private func ideaSteps(for names: [String]) -> [String] {
+        [
+            "Heat a splash of olive oil in a pan over medium-high heat.",
+            "Add \(names.joined(separator: " and ")) and cook 3–4 minutes until warmed through.",
+            "Season with salt, pepper, and garlic if using.",
+            "Serve immediately — enjoy before it goes to waste!"
+        ]
     }
 
-    // MARK: Current streak
-    var currentStreak: Int {
-        var streak = 0
-        var checkDate = Calendar.current.startOfDay(for: .now)
-        let daySet = Set(allEntries.map { Calendar.current.startOfDay(for: $0.date) })
-        while daySet.contains(checkDate) {
-            streak += 1
-            checkDate = Calendar.current.date(byAdding: .day, value: -1, to: checkDate)!
-        }
-        return streak
+    // MARK: - Pro stats
+
+    var usedCount: Int  { logs.filter { $0.action == "used" }.count }
+    var wastedCount: Int { logs.filter { $0.action == "wasted" }.count }
+    var savedThisWeek: Int {
+        let cutoff = Calendar.current.date(byAdding: .weekOfYear, value: -1, to: .now) ?? .now
+        return logs.filter { $0.action == "used" && $0.date >= cutoff }.count
     }
+
+    // MARK: - Delete all
 
     func deleteAllData() {
-        let ctx = container.mainContext
-        try? ctx.delete(model: WaveEntry.self)
-        try? ctx.delete(model: TrendCache.self)
-        try? ctx.save()
+        items.forEach { context.delete($0) }
+        logs.forEach  { context.delete($0) }
+        let ideaDesc = FetchDescriptor<UseIdea>()
+        let ideas = (try? context.fetch(ideaDesc)) ?? []
+        ideas.forEach { context.delete($0) }
+        save()
+    }
+
+    private func save() {
+        try? context.save()
         reload()
     }
 }

@@ -3,12 +3,11 @@ import SwiftUI
 struct SettingsView: View {
     @EnvironmentObject var store: Store
     @EnvironmentObject var appModel: AppModel
-    @Environment(\.dismiss) private var dismiss
+    @Environment(\.dismiss) var dismiss
 
     @AppStorage("quickmath.theme") private var themeRaw = AppTheme.system.rawValue
-
-    @State private var showPaywall = false
     @State private var showDeleteConfirm = false
+    @State private var showPaywall = false
 
     private var theme: Binding<AppTheme> {
         Binding(
@@ -21,35 +20,40 @@ struct SettingsView: View {
         NavigationStack {
             ZStack {
                 QMBackground()
-
-                List {
-                    // Pro section
-                    Section("Subscription") {
+                Form {
+                    // MARK: Pro
+                    Section("Leftover Pro") {
                         if store.isPro {
                             HStack {
-                                Text("Tideline Pro")
-                                Spacer()
-                                Text("Active")
-                                    .foregroundStyle(Color.qmCorrect)
+                                Image(systemName: "checkmark.seal.fill")
+                                    .foregroundStyle(Color.qmAccent)
+                                Text("You have Pro")
                                     .font(.subheadline.weight(.medium))
                             }
-                            Link("Manage Subscription",
-                                 destination: URL(string: "https://apps.apple.com/account/subscriptions")!)
+                            if let url = URL(string: "https://apps.apple.com/account/subscriptions") {
+                                Link(destination: url) {
+                                    Label("Manage Subscription", systemImage: "arrow.up.right")
+                                }
                                 .foregroundStyle(Color.qmAccent)
+                            }
                         } else {
-                            Button("Unlock Tideline Pro") {
+                            Button {
                                 showPaywall = true
+                            } label: {
+                                Label("Unlock Leftover Pro — \(store.displayPrice)/mo", systemImage: "lock.open.fill")
+                            }
+                            .foregroundStyle(Color.qmAccent)
+
+                            Button {
+                                Task { await store.restore() }
+                            } label: {
+                                Label("Restore Purchases", systemImage: "arrow.clockwise")
                             }
                             .foregroundStyle(Color.qmAccent)
                         }
-
-                        Button("Restore Purchase") {
-                            Task { await store.restore() }
-                        }
-                        .foregroundStyle(Color.qmAccent)
                     }
 
-                    // Appearance
+                    // MARK: Appearance
                     Section("Appearance") {
                         Picker("Theme", selection: theme) {
                             ForEach(AppTheme.allCases) { t in
@@ -59,48 +63,50 @@ struct SettingsView: View {
                         .pickerStyle(.segmented)
                     }
 
-                    // Legal
-                    Section("Legal") {
-                        Link("Privacy Policy",
-                             destination: URL(string: "https://shimondeitel.github.io/tideline-site/privacy.html")!)
+                    // MARK: About
+                    Section("About") {
+                        if let url = URL(string: "https://shimondeitel.github.io/leftover-site/privacy.html") {
+                            Link(destination: url) {
+                                Label("Privacy Policy", systemImage: "hand.raised.fill")
+                            }
                             .foregroundStyle(Color.qmAccent)
-                        Link("Terms of Use",
-                             destination: URL(string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/")!)
+                        }
+                        if let url = URL(string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/") {
+                            Link(destination: url) {
+                                Label("Terms of Use", systemImage: "doc.text")
+                            }
                             .foregroundStyle(Color.qmAccent)
+                        }
                     }
 
-                    // Data
+                    // MARK: Data
                     Section("Data") {
-                        Button("Delete All Data") {
+                        Button(role: .destructive) {
                             showDeleteConfirm = true
+                        } label: {
+                            Label("Delete All Data", systemImage: "trash")
                         }
-                        .foregroundStyle(Color.qmWrong)
                     }
                 }
-                .scrollContentBackground(.hidden)
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
+                ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }
             }
-            .sheet(isPresented: $showPaywall) {
-                PaywallView()
-                    .environmentObject(store)
-            }
-            .confirmationDialog(
-                "Delete all Tideline data?",
-                isPresented: $showDeleteConfirm,
-                titleVisibility: .visible
-            ) {
-                Button("Delete All", role: .destructive) {
+            .confirmationDialog("Delete all data?", isPresented: $showDeleteConfirm, titleVisibility: .visible) {
+                Button("Delete Everything", role: .destructive) {
                     appModel.deleteAllData()
+                    dismiss()
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("This removes all your logged energy entries and cannot be undone.")
+                Text("This will permanently remove all your fridge items, ideas, and history.")
+            }
+            .sheet(isPresented: $showPaywall) {
+                PaywallView().environmentObject(store)
             }
         }
     }
